@@ -1,13 +1,15 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # dependencies = [
-#   "livekit",
+#   "livekit-api",
 #   "sounddevice",
 #   "python-dotenv",
 #   "asyncio",
 #   "numpy",
 # ]
 # ///
+
+
 import os
 import logging
 import asyncio
@@ -15,9 +17,17 @@ import argparse
 import sys
 import time
 import threading
-import select
-import termios
-import tty
+
+import sys
+import threading
+
+if os.name != "nt":
+    import select
+    import termios
+    import tty
+else:
+    import msvcrt  # Windows-safe key reading
+
 
 from dotenv import load_dotenv
 from signal import SIGINT, SIGTERM
@@ -212,30 +222,63 @@ class AudioStreamer:
         """Start keyboard input handler in a separate thread"""
         def keyboard_handler():
             try:
-                # Save original terminal settings
-                old_settings = termios.tcgetattr(sys.stdin)
-                tty.setraw(sys.stdin.fileno())
-                
-                while self.running:
-                    if select.select([sys.stdin], [], [], 0.1)[0]:
-                        key = sys.stdin.read(1)
-                        if key.lower() == 'm':
-                            self.toggle_mute()
-                        elif key.lower() == 'q':
-                            self.logger.info("Quit requested by user")
-                            self.running = False
-                            break
-                        elif key == '\x03':  # Ctrl+C
-                            break
-                            
+                if os.name != "nt":
+                    # Unix-like: use termios
+                    old_settings = termios.tcgetattr(sys.stdin)
+                    tty.setraw(sys.stdin.fileno())
+                    while self.running:
+                        if select.select([sys.stdin], [], [], 0.1)[0]:
+                            key = sys.stdin.read(1)
+                            if key.lower() == 'm':
+                                self.toggle_mute()
+                            elif key.lower() == 'q':
+                                self.logger.info("Quit requested by user")
+                                self.running = False
+                                break
+                            elif key == '\x03':  # Ctrl+C
+                                break
+                    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+                else:
+                # Windows: use msvcrt.getch()
+                    while self.running:
+                        if msvcrt.kbhit():
+                            key = msvcrt.getch().decode(errors='ignore').lower()
+                            if key == 'm':
+                                self.toggle_mute()
+                            elif key == 'q':
+                                self.logger.info("Quit requested by user")
+                                self.running = False
+                                break
+                            elif key == '\x03':
+                                break
+                        time.sleep(0.1)
             except Exception as e:
                 self.logger.error(f"Keyboard handler error: {e}")
-            finally:
-                # Restore terminal settings
                 try:
-                    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
-                except:
-                    pass
+                    # Save original terminal settings
+                    old_settings = termios.tcgetattr(sys.stdin)
+                    tty.setraw(sys.stdin.fileno())
+                    
+                    while self.running:
+                        if select.select([sys.stdin], [], [], 0.1)[0]:
+                            key = sys.stdin.read(1)
+                            if key.lower() == 'm':
+                                self.toggle_mute()
+                            elif key.lower() == 'q':
+                                self.logger.info("Quit requested by user")
+                                self.running = False
+                                break
+                            elif key == '\x03':  # Ctrl+C
+                                break
+                                
+                except Exception as e:
+                    self.logger.error(f"Keyboard handler error: {e}")
+                finally:
+                    # Restore terminal settings
+                    try:
+                        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+                    except:
+                        pass
         
         self.keyboard_thread = threading.Thread(target=keyboard_handler, daemon=True)
         self.keyboard_thread.start()
@@ -768,15 +811,41 @@ async def main(participant_name: str, enable_aec: bool = True):
         streamer.restore_terminal()
         logger.info("=== CLEANUP COMPLETE ===")
 
+import argparse
+import asyncio
+import logging
+import sys
+import signal
+
+# --------------------------------------------------
+# Make sure you have your main() async function defined above
+# async def main(name, enable_aec=True): ...
+# --------------------------------------------------
+
+async def cleanup():
+    """Cancel all running asyncio tasks except the current one."""
+    task = asyncio.current_task()
+    tasks = [t for t in asyncio.all_tasks() if t is not task]
+    for t in tasks:
+        t.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+def handle_exit():
+    """Graceful shutdown called on KeyboardInterrupt"""
+    asyncio.create_task(cleanup())
+    print("\nShutting down gracefully...")
+
 if __name__ == "__main__":
-    # Parse command line arguments
+    # -----------------------------
+    # Command-line argument parsing
+    # -----------------------------
     parser = argparse.ArgumentParser(description="LiveKit bidirectional audio streaming with AEC")
     parser.add_argument(
-        "--name", 
+        "--name",
         "-n",
         type=str,
         default="audio-streamer",
-        help="Participant name to use when connecting to the room (default: audio-streamer)"
+        help="Participant name when connecting to the room (default: audio-streamer)"
     )
     parser.add_argument(
         "--disable-aec",
@@ -789,52 +858,50 @@ if __name__ == "__main__":
         help="Enable debug logging"
     )
     args = parser.parse_args()
-    
-    # Set up logging
+
+    # -----------------------------
+    # Logging setup
+    # -----------------------------
     log_level = logging.DEBUG if args.debug else logging.INFO
     logging.basicConfig(
         level=log_level,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         handlers=[
             logging.FileHandler("stream_audio.log"),
-            # Only log to console in debug mode - otherwise interferes with meter
             *([logging.StreamHandler()] if args.debug else []),
         ],
     )
-    
-    # Also log to console with colors for easier debugging (only in debug mode)
+
     if args.debug:
         console_handler = logging.StreamHandler()
         console_handler.setLevel(log_level)
-        formatter = logging.Formatter('%(levelname)s: %(message)s')
+        formatter = logging.Formatter("%(levelname)s: %(message)s")
         console_handler.setFormatter(formatter)
-    
-    # Fix deprecation warning by using asyncio.run() instead of get_event_loop()
-    async def cleanup():
-        task = asyncio.current_task()
-        tasks = [t for t in asyncio.all_tasks() if t is not task]
-        for t in tasks:
-            t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        logging.getLogger().addHandler(console_handler)
 
-    def signal_handler():
-        asyncio.create_task(cleanup())
+    # -----------------------------
+    # Signal handling (cross-platform)
+    # -----------------------------
+    if sys.platform != "win32":
+        # Unix-like: handle SIGINT and SIGTERM
+        loop = asyncio.get_event_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, handle_exit)
+    else:
+        # Windows fallback: KeyboardInterrupt only
+        import threading
+        def win_signal_watcher():
+            try:
+                while True:
+                    time.sleep(0.1)
+            except KeyboardInterrupt:
+                handle_exit()
+        threading.Thread(target=win_signal_watcher, daemon=True).start()
 
-    # Use asyncio.run() to properly handle the event loop
+    # -----------------------------
+    # Run main() with asyncio
+    # -----------------------------
     try:
-        # For signal handling, we need to use the lower-level approach
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        main_task = asyncio.ensure_future(main(args.name, enable_aec=not args.disable_aec))
-        for signal in [SIGINT, SIGTERM]:
-            loop.add_signal_handler(signal, signal_handler)
-
-        try:
-            loop.run_until_complete(main_task)
-        except KeyboardInterrupt:
-            pass
-        finally:
-            loop.close()
+        asyncio.run(main(args.name, enable_aec=not args.disable_aec))
     except KeyboardInterrupt:
-        pass 
+        handle_exit()
